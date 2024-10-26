@@ -1,24 +1,35 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
-var fileEventTimes = make(map[string]time.Time) // 记录每个文件的最后处理时间
-// var fileSizes = make(map[string]int64)          // 记录文件大小
-var debounceDuration1 = 1 * time.Second
-var debounceDuration = 10 * time.Second    // 静默期，确保文件没有新的写入操作
-var checkInterval = 500 * time.Millisecond // 文件大小检测间隔
+var (
+	fileEventTimes    sync.Map
+	debounceDuration1 = 1 * time.Second
+	debounceDuration  = 5 * time.Second        // 静默期，确保文件没有新的写入操作
+	checkInterval     = 500 * time.Millisecond // 文件大小检测间隔
+)
 
 func main() {
-	watchDir := "d:/testDir" // 监控的目录
+	// 使用 flag 包解析命令行参数
+	watchDir := flag.String("f", "./", "Directory to watch for file changes")
+	flag.Parse()
+
+	// 确保提供了 watchDir 参数
+	if *watchDir == "" {
+		log.Fatal("Please specify a directory to watch using -watchDir")
+	}
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
@@ -26,7 +37,6 @@ func main() {
 	defer watcher.Close()
 
 	var wg sync.WaitGroup
-	var mu sync.Mutex
 
 	go func() {
 		for {
@@ -36,18 +46,15 @@ func main() {
 					return
 				}
 
-				if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
+				// 只处理非排除文件和文件夹的创建或写入事件
+				if (event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write) && !shouldIgnore(event.Name) {
 					fileInfo, err := os.Stat(event.Name)
 					if err == nil && fileInfo.IsDir() {
 						log.Println("New directory detected:", event.Name)
 						addWatcherRecursive(watcher, event.Name)
-					} else {
-						mu.Lock()
-						if shouldProcess(event.Name) {
-							wg.Add(1)
-							go checkIfFileComplete(event.Name, &wg) // 检测文件是否写入完成
-						}
-						mu.Unlock()
+					} else if shouldProcess(event.Name) {
+						wg.Add(1)
+						go checkIfFileComplete(event.Name, &wg) // 检测文件是否写入完成
 					}
 				}
 			case err, ok := <-watcher.Errors:
@@ -59,16 +66,21 @@ func main() {
 		}
 	}()
 
-	addWatcherRecursive(watcher, watchDir)
+	addWatcherRecursive(watcher, *watchDir)
 
 	<-make(chan struct{})
 }
 
-// 递归添加目录及其子目录的监听
+// 递归添加目录及其子目录的监听，排除特定文件夹
 func addWatcherRecursive(watcher *fsnotify.Watcher, dir string) {
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+		// 排除以 .oss 开头的文件夹
+		if info.IsDir() && strings.HasPrefix(info.Name(), ".oss") {
+			log.Println("Skipping directory:", path)
+			return filepath.SkipDir
 		}
 		if info.IsDir() {
 			log.Println("Watching directory:", path)
@@ -81,14 +93,26 @@ func addWatcherRecursive(watcher *fsnotify.Watcher, dir string) {
 	}
 }
 
-// 判断是否应该处理该文件（基于时间窗口去重）
-func shouldProcess(filePath string) bool {
-	lastProcessed, exists := fileEventTimes[filePath]
-	if !exists || time.Since(lastProcessed) > debounceDuration1 {
-		fileEventTimes[filePath] = time.Now()
+// 判断是否应该忽略该文件或文件夹
+func shouldIgnore(path string) bool {
+	// 排除以 .temp 结尾的文件
+	if strings.HasSuffix(path, ".temp") {
+		log.Println("Ignoring file:", path)
 		return true
 	}
 	return false
+}
+
+// 判断是否应该处理该文件（基于时间窗口去重）
+func shouldProcess(filePath string) bool {
+	now := time.Now()
+	if lastProcessed, ok := fileEventTimes.Load(filePath); ok {
+		if time.Since(lastProcessed.(time.Time)) < debounceDuration1 {
+			return false
+		}
+	}
+	fileEventTimes.Store(filePath, now)
+	return true
 }
 
 // 检测文件是否已经写入完成
@@ -120,6 +144,7 @@ func checkIfFileComplete(filePath string, wg *sync.WaitGroup) {
 		if stableDuration >= debounceDuration {
 			fmt.Println("File write complete, processing:", filePath)
 			handleFile(filePath)
+			fileEventTimes.Delete(filePath) // 移除缓存记录
 			return
 		}
 
