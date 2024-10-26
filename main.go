@@ -22,7 +22,7 @@ var (
 
 func main() {
 	// 使用 flag 包解析命令行参数
-	watchDir := flag.String("f", "./", "Directory to watch for file changes")
+	watchDir := flag.String("watchDir", "", "Directory to watch for file changes")
 	flag.Parse()
 
 	// 确保提供了 watchDir 参数
