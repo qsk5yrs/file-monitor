@@ -11,6 +11,7 @@ import (
 )
 
 var taskMutex sync.Mutex
+var isTaskRunning bool
 
 func log(format string, v ...interface{}) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
@@ -37,7 +38,12 @@ func longRunningTask() {
 
 func executeRCloneTask(sourceBucket, destBucket string) {
 	taskMutex.Lock()
-	defer taskMutex.Unlock()
+	isTaskRunning = true
+
+	defer func() {
+		isTaskRunning = false
+		taskMutex.Unlock()
+	}()
 
 	startTime := time.Now()
 	log("RClone Sync Task started.")
@@ -98,9 +104,15 @@ func main() {
 	if *startCmd {
 		c := cron.New()
 		_, err := c.AddFunc(fmt.Sprintf("@every %ds", *interval), func() {
+			taskMutex.Lock()
+			if isTaskRunning {
+				taskMutex.Unlock()
+				return
+			}
+			taskMutex.Unlock()
 			go func() {
-				//longRunningTask() // 使用新的goroutine来执行任务
-				executeRCloneTask(*sourceBucket, *destBucket)
+				//longRunningTask()
+				executeRCloneTask(*sourceBucket, *destBucket) // 使用新的goroutine来执行任务
 			}()
 		})
 		if err != nil {
